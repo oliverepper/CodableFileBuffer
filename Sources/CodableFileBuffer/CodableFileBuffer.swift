@@ -8,127 +8,141 @@
 import Foundation
 import os.log
 
-@available(iOS 10.0, *)
-extension OSLog {
-    static let CodableFileBuffer = OSLog(subsystem: Bundle.main.bundleIdentifier!, category: "Codable File Buffer")
-}
 
 enum CodableFileBufferError: Error {
+    case notFound
     case fileExists
-    case directoryMissing
+    case appendFailed
+    case retrieveDataFailed
+    case resetFailed
 }
 
-@available(iOS 13.0, *)
-public class CodableFileBuffer<T: Codable> {
+extension Data {
+    enum Characters: String {
+        case openBracket = "["
+        case comma = ","
+        case closingBracket = "]"
+    }
+
+    static var openBracket: Self {
+        data(for: .openBracket)
+    }
+
+    static var comma: Self {
+        data(for: .comma)
+    }
+
+    static var closingBracket: Self {
+        data(for: .closingBracket)
+    }
+
+    static private func data(for character: Characters) -> Data {
+        character.rawValue.data(using: .utf8)!
+    }
+}
+
+public final class CodableFileBuffer<T: Codable> {
 
     public private(set) var count = 0
 
     private var fileURL: URL
-    private var encoder = JSONEncoder()
-    private var decoder = JSONDecoder()
 
-    // MARK: lazy fileHandle
-    private lazy var fileHandle: FileHandle = {
+    private lazy var fileHandle: FileHandle? = {
         // create FileHandle and insert "[" at the beginning of the file
-        var handle = FileHandle()
-        do {
-            handle = try FileHandle(forUpdating: fileURL)
-            handle.write("[".data(using: .utf8)!)
-        } catch {
-            fatalError("CodableFileBuffer could not create a FileHandle for \(fileURL.lastPathComponent): \(error.localizedDescription)")
-        }
-
+        let handle = try? FileHandle(forUpdating: fileURL)
+        handle?.write(.openBracket)
         return handle
     }()
 
-    // MARK: initializer
-    public init(filename: String? = nil, searchPath: FileManager.SearchPathDirectory = .documentDirectory) throws {
-        // build the URL
-        guard let dir = FileManager.default.urls(for: searchPath, in: .userDomainMask).first else {
-            fatalError("Cannot find \(searchPath)")
+    // MARK: init
+    public init(filename: String? = nil, path: FileManager.SearchPathDirectory = .cachesDirectory) throws {
+        guard let dir = FileManager.default.urls(for: path, in: .userDomainMask).first else {
+            throw CodableFileBufferError.notFound
         }
 
-        // create dir if it doesn't exists
+        // create directory if needed
         if !FileManager.default.fileExists(atPath: dir.path) {
-            do {
-                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
-            } catch {
-                fatalError("CodableFileBuffer could not create the required directory")
-            }
+            try FileManager.default.createDirectory(at: dir,
+                                                    withIntermediateDirectories: true,
+                                                    attributes: nil)
         }
 
-        fileURL = dir.appendingPathComponent(filename ?? "\(Bundle.main.bundleIdentifier!)_\(UUID())")
+        fileURL = dir.appendingPathComponent(filename ?? "\(Bundle.main.bundleIdentifier!)_" + UUID().uuidString)
         fileURL.appendPathExtension("json")
 
-        // create file
+        // create the file
         if !FileManager.default.fileExists(atPath: fileURL.path) {
-            FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-            os_log("%@ created in %@", log: OSLog.CodableFileBuffer, type: .debug, fileURL.lastPathComponent, fileURL.deletingLastPathComponent().path)
+            FileManager.default.createFile(atPath: fileURL.path,
+                                           contents: nil,
+                                           attributes: nil)
+            os_log("%@ created in %@", fileURL.lastPathComponent, fileURL.deletingLastPathComponent().path)
         } else {
             throw CodableFileBufferError.fileExists
         }
     }
 
-    public convenience init() {
-        try! self.init(filename: nil, searchPath: .documentDirectory)
-    }
-
     // MARK: append
-    public func append(_ codable: T) {
-        // encode codable
-        guard let data = try? encoder.encode(codable) else {
-            fatalError("Cannot encode \(codable)")
+    public func append(_ codable: T, encoder: JSONEncoder = JSONEncoder()) throws {
+        let data = try encoder.encode(codable)
+
+        // write to filehandle
+        do {
+            try fileHandle?.write(contentsOf: data)
+            try fileHandle?.write(contentsOf: Data.comma)
+        } catch {
+            throw CodableFileBufferError.appendFailed
         }
 
-        // write to FileHandle
-        fileHandle.write(data)
-        fileHandle.write(",".data(using: .utf8)!)
-
-        // update the count
         count += 1
 
-        // log
-        os_log("Did append codable to CodableFileBuffer at: %@", log: OSLog.CodableFileBuffer, type: .debug, fileURL.lastPathComponent)
+        os_log("Did append codable to Buffer: %@", fileURL.lastPathComponent)
     }
 
     // MARK: retrieve
-    public func retrieve() -> [T] {
+    public func retrieve(decoder: JSONDecoder = JSONDecoder()) -> [T] {
         // decode and return
         do {
-            return try decoder.decode([T].self, from: getData())
+            guard let data = try getData() else {
+                throw CodableFileBufferError.retrieveDataFailed
+            }
+            return try decoder.decode([T].self, from: data)
         } catch {
             return [T]()
         }
     }
 
     // MARK: reset
-    public func reset() {
-        // wipe the file
-        os_log("Wiping the file %@", log: OSLog.CodableFileBuffer, type: .info, fileURL.path)
-        fileHandle.truncateFile(atOffset: 0)
-        fileHandle.write("[".data(using: .utf8)!)
-        try? fileHandle.synchronize()
+    public func reset() throws {
+        os_log("Wiping the file %@", fileURL.path)
+        fileHandle?.truncateFile(atOffset: 0)
+        do {
+            try fileHandle?.write(contentsOf: Data.openBracket)
+            try fileHandle?.synchronize()
+        } catch {
+            throw CodableFileBufferError.resetFailed
+        }
 
-        // reset the count
         count = 0
-
-        // log
-        os_log("Did reset.", log: OSLog.CodableFileBuffer, type: .info)
     }
 
     // MARK: deinitializer
     deinit {
-        try? fileHandle.close()
-        os_log("FileHandle %@ closed", log: OSLog.CodableFileBuffer, type: .debug, fileHandle.debugDescription)
+        try? fileHandle?.close()
+        os_log("FileHandle %@ closed", fileHandle.debugDescription)
+        
         try? FileManager.default.removeItem(at: fileURL)
-        os_log("File at path %@ deleted.", log: OSLog.CodableFileBuffer, type: .debug, fileURL.path)
+        os_log("File at path %@ deleted.", fileURL.path)
     }
 
-    private func getData() -> Data {
-        fileHandle.seek(toFileOffset: 0)
-        var data = fileHandle.readDataToEndOfFile()
-        data.append("]".data(using: .utf8)!)
-
+    private func getData() throws -> Data? {
+        guard let fileHandle = fileHandle else {
+            return nil
+        }
+        let eof = try fileHandle.seekToEnd()
+        try fileHandle.seek(toOffset: 0)
+        var data = try fileHandle.read(upToCount: Int(eof))
+        data?.append(.closingBracket)
         return data
     }
 }
+
